@@ -1,57 +1,146 @@
--- Connect to the database 
+-- ***************************************
+-- Step 1: Connect to Database & Extract Data
+-- ***************************************
+
+-- Connect to the insurance database
 CONNECT TO DATABASE X_INSURANCE
 USING 'server=X_server; database=X1; user=Harry.Z; password=88888888';
 
--- Extract policy data for comprehensive insurance
+-- ***************************************
+-- Step 2: Extract Policy Data (2021-2023)
+-- ***************************************
+
 CREATE TABLE Policy_Data AS
 SELECT 
-    Policy_ID,
-    Customer_ID,
-    Vehicle_ID,
-    Policy_Start_Date,
-    Policy_End_Date,
-    Policy_Term,         
-    Policy_Status,       
-    Renewal_Status,      
-    Premium_Amount,
-    Deductible_Amount,    
-    Coverage_Limit,       
-    Coverage_Type,       
-    Zipcode,
-    Region,
-    Exposure,            
-    Customer_Age,
-    Customer_Gender,
-    Marital_Status,
-    Credit_Score,
-    Years_With_Company,  
-    Claim_History,      
-    Vehicle_Type,
-    Vehicle_Make,
-    Vehicle_Model,
-    Vehicle_Year,
-    Vehicle_Price,
-    Vehicle_Usage,       
-    Mileage,             
-    Anti_Theft_Device,    
-    Garaging_Location
-FROM Policies
-LEFT JOIN Customers 
-    ON Policies.Customer_ID = Customers.Customer_ID
-LEFT JOIN Vehicles 
-    ON Policies.Vehicle_ID = Vehicles.Vehicle_ID
-WHERE Coverage_Type = 'Comprehensive';
+    p.Policy_ID,
+    p.Customer_ID,
+    p.Vehicle_ID,
+    p.Policy_Start_Date,
+    p.Policy_End_Date,
+    p.Policy_Term,       
+    p.Policy_Status,       -- Active, Expired, Canceled
+    p.Renewal_Status,      -- Whether the policy was renewed
+    p.Premium_Amount,
+    p.Deductible_Amount,    -- Deductible chosen by the policyholder
+    p.Coverage_Limit,       -- Maximum payout coverage limit
+    p.Coverage_Type,       
+    p.Zipcode,
+    p.Region,
+    p.Exposure,            -- Time insured during the policy period
 
--- Extract claims data separately
+    -- Customer Information
+    c.Customer_Age,
+    c.Customer_Gender,
+    c.Marital_Status,
+    c.Credit_Score,
+    c.Years_With_Company,  -- Number of years customer has been with the insurer
+    c.Claim_History,      -- Number of past claims
+
+    -- Vehicle Information
+    v.Vehicle_Type,
+    v.Vehicle_Make,
+    v.Vehicle_Model,
+    v.Vehicle_Year,
+    v.Vehicle_Price,
+    v.Vehicle_Usage,       -- Personal or Commercial use
+    v.Mileage,             
+    v.Anti_Theft_Device,    -- Whether the vehicle has an anti-theft system
+    v.Garaging_Location,    -- Home, street, commercial garage
+
+    -- Calculate Earned Premium (EP)
+    (p.Premium_Amount * 
+        (DATEDIFF(DAY, p.Policy_Start_Date, LEAST(p.Policy_End_Date, '2023-12-31')) / 
+         DATEDIFF(DAY, p.Policy_Start_Date, p.Policy_End_Date))
+    ) AS Earned_Premium
+
+FROM Policies p
+LEFT JOIN Customers c 
+    ON p.Customer_ID = c.Customer_ID
+LEFT JOIN Vehicles v 
+    ON p.Vehicle_ID = v.Vehicle_ID
+WHERE p.Policy_Start_Date BETWEEN '2021-01-01' AND '2023-12-31'
+      AND p.Coverage_Type = 'Comprehensive';
+
+-- ***************************************
+-- Step 3: Extract Claim Data (2021-2024)
+-- ***************************************
+
+-- Extract claims only for policies issued before 2024
 CREATE TABLE Claim_Data AS
 SELECT 
-    Claim_ID,
-    Policy_ID,
-    Claim_Date,
-    Claim_Amount,
-    Claim_Type,
-    Claim_Status,
-    At_Fault,
-    Claim_Cause
-FROM Claims;
+    c.Claim_ID,
+    c.Policy_ID,
+    c.Claim_Date,
+    c.Claim_Amount,
+    c.Claim_Type,
+    c.Claim_Status,
+    c.At_Fault,
+    c.Claim_Cause,
+    
+    -- Apply Loss Development Factor (LDF) for claims in the last 6 months
+    CASE 
+        WHEN c.Claim_Status = 'Open' AND c.Claim_Date >= '2023-07-01' 
+        THEN c.Claim_Amount * 1.2  -- LDF = 1.2 for recent open claims
+        ELSE c.Claim_Amount
+    END AS Adjusted_Claim_Amount
 
+FROM Claims c
+LEFT JOIN Policies p 
+    ON c.Policy_ID = p.Policy_ID
+WHERE c.Claim_Date BETWEEN '2021-01-01' AND '2024-12-31'
+      AND p.Policy_Start_Date BETWEEN '2021-01-01' AND '2023-12-31';
+
+-- ***************************************
+-- Step 4: Data Cleaning & Deduplication
+-- ***************************************
+
+-- Remove duplicate policies
+DELETE FROM Policy_Data
+WHERE Policy_ID IN (
+    SELECT Policy_ID FROM (
+        SELECT Policy_ID, ROW_NUMBER() OVER (PARTITION BY Policy_ID ORDER BY Policy_Start_Date DESC) AS rn
+        FROM Policy_Data
+    ) t
+    WHERE t.rn > 1
+);
+
+-- Remove duplicate claims
+DELETE FROM Claim_Data
+WHERE Claim_ID IN (
+    SELECT Claim_ID FROM (
+        SELECT Claim_ID, ROW_NUMBER() OVER (PARTITION BY Claim_ID ORDER BY Claim_Date DESC) AS rn
+        FROM Claim_Data
+    ) t
+    WHERE t.rn > 1
+);
+
+-- Remove policies with missing key variables (Gender, Zipcode, Vehicle_Model)
+DELETE FROM Policy_Data
+WHERE Customer_Gender IS NULL OR Zipcode IS NULL OR Vehicle_Model IS NULL;
+
+-- ***************************************
+-- Step 5: Merge Cleaned Policy & Claim Data
+-- ***************************************
+
+CREATE TABLE Insurance_Data AS
+SELECT 
+    p.*, 
+    c.Claim_ID, c.Claim_Date, c.Adjusted_Claim_Amount
+FROM Policy_Data p
+LEFT JOIN Claim_Data c
+ON p.Policy_ID = c.Policy_ID;
+
+-- ***************************************
+-- Step 6: Final Checks
+-- ***************************************
+
+-- Check distribution of Earned Premium & Adjusted Claim Amount
+SELECT 
+    MIN(Earned_Premium), MAX(Earned_Premium), AVG(Earned_Premium), 
+    MIN(Adjusted_Claim_Amount), MAX(Adjusted_Claim_Amount), AVG(Adjusted_Claim_Amount)
+FROM Insurance_Data;
+
+-- Check categorical variable distributions
+SELECT Coverage_Type, COUNT(*) FROM Insurance_Data GROUP BY Coverage_Type;
+SELECT Vehicle_Type, COUNT(*) FROM Insurance_Data GROUP BY Vehicle_Type;
+SELECT Claim_Type, COUNT(*) FROM Insurance_Data GROUP BY Claim_Type;
